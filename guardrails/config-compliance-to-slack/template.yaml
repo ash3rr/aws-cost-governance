@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cost guard rails. AWS Config rules check that S3 buckets have a lifecycle
+  configuration and that CloudWatch Logs log groups have a retention period.
+  When a resource becomes NON_COMPLIANT, EventBridge invokes a Lambda function
+  that posts a plain-text message to Slack.
+
+Parameters:
+  WebhookSecretArn:
+    Type: String
+    AllowedPattern: '^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$'
+    Description: >
+      ARN of an existing Secrets Manager secret whose value is the Slack
+      incoming webhook URL (plain string, or JSON with a webhook_url key).
+  LogRetentionMaxDays:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >
+      Log groups that keep data longer than this are also NON_COMPLIANT.
+      0 means only "Never expire" is flagged.
+  LogRetentionExemptPrefixes:
+    Type: String
+    Default: ''
+    Description: Comma-separated log group name prefixes the retention rule skips.
+  LogRetentionCheckFrequency:
+    Type: String
+    Default: TwentyFour_Hours
+    AllowedValues: [One_Hour, Three_Hours, Six_Hours, Twelve_Hours, TwentyFour_Hours]
+    Description: How often the log retention rule runs.
+  NotifierLogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+    Description: Retention for this stack's own Lambda log groups.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    MemorySize: 128
+
+Resources:
+  # -------------------------------------------------------------------------
+  # Config rules
+  # -------------------------------------------------------------------------
+  S3LifecyclePolicyRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: cost-s3-lifecycle-policy-present
+      Description: >
+        NON_COMPLIANT when a bucket has no enabled lifecycle rule. Uses the
+        managed rule S3_LIFECYCLE_POLICY_CHECK with no parameters.
+      Scope:
+        ComplianceResourceTypes: ['AWS::S3::Bucket']
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_LIFECYCLE_POLICY_CHECK
+
+  LogRetentionRuleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Config custom rule. Log groups must not keep data forever.
+      CodeUri: src/log_retention_rule/
+      Handler: log_retention_rule.handler
+      Timeout: 300
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: logs:DescribeLogGroups
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - config:PutEvaluations
+                - config:GetComplianceDetailsByConfigRule
+              Resource: '*'
+
+  LogRetentionRuleFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${LogRetentionRuleFunction}
+      RetentionInDays: !Ref NotifierLogRetentionDays
+
+  LogRetentionRuleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LogRetentionRuleFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  LogGroupRetentionRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: LogRetentionRuleInvokePermission
+    Properties:
+      ConfigRuleName: cost-log-group-retention-set
+      Description: >
+        NON_COMPLIANT when a log group has no retention period (Never expire),
+        or keeps data longer than maxRetentionDays when that is set.
+      MaximumExecutionFrequency: !Ref LogRetentionCheckFrequency
+      InputParameters:
+        maxRetentionDays: !Ref LogRetentionMaxDays
+        exemptPrefixes: !Ref LogRetentionExemptPrefixes
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt LogRetentionRuleFunction.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ScheduledNotification
+            MaximumExecutionFrequency: !Ref LogRetentionCheckFrequency
+
+  # -------------------------------------------------------------------------
+  # Notification path: EventBridge rule to Lambda to Slack
+  # -------------------------------------------------------------------------
+  NotifierDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days, the SQS maximum
+      SqsManagedSseEnabled: true
+
+  SlackNotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Posts AWS Config NON_COMPLIANT results to Slack.
+      CodeUri: src/notifier/
+      Handler: slack_notifier.handler
+      Timeout: 30
+      # One at a time keeps the webhook under Slack's rate limit when a first
+      # evaluation produces many results at once.
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          WEBHOOK_SECRET_ARN: !Ref WebhookSecretArn
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt NotifierDeadLetterQueue.Arn
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref WebhookSecretArn
+
+  NonCompliantEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: AWS Config results that turn NON_COMPLIANT for the cost rules.
+      EventPattern:
+        source: [aws.config]
+        detail-type: [Config Rules Compliance Change]
+        detail:
+          messageType: [ComplianceChangeNotification]
+          configRuleName:
+            - !Ref S3LifecyclePolicyRule
+            - !Ref LogGroupRetentionRule
+          newEvaluationResult:
+            complianceType: [NON_COMPLIANT]
+      Targets:
+        - Id: slack-notifier
+          Arn: !GetAtt SlackNotifierFunction.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 5
+            MaximumEventAgeInSeconds: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt NotifierDeadLetterQueue.Arn
+
+  NonCompliantEventInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SlackNotifierFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NonCompliantEventRule.Arn
+
+  # EventBridge needs permission to write events it could not deliver.
+  NotifierDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref NotifierDeadLetterQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeDeadLetters
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt NotifierDeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt NonCompliantEventRule.Arn
+
+  SlackNotifierFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${SlackNotifierFunction}
+      RetentionInDays: !Ref NotifierLogRetentionDays
+
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Slack notifications that could not be delivered are waiting in the DLQ.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt NotifierDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  S3LifecycleRuleName:
+    Value: !Ref S3LifecyclePolicyRule
+  LogRetentionRuleName:
+    Value: !Ref LogGroupRetentionRule
+  NotifierFunctionName:
+    Value: !Ref SlackNotifierFunction
+  DeadLetterQueueUrl:
+    Value: !Ref NotifierDeadLetterQueue

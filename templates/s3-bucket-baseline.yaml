@@ -1,0 +1,303 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  S3 bucket with a cost and security baseline. Non-production buckets expire
+  objects after a set number of days. Production buckets transition objects to
+  S3 Intelligent-Tiering, with optional archive tiers. All buckets are
+  versioned with noncurrent version expiration, block public access, enforce
+  TLS and SSE-KMS, and limit bucket administration to an admin role pattern.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Bucket}
+        Parameters: [Environment, Application, BucketName, KmsKeyArn]
+      - Label: {default: Lifecycle}
+        Parameters:
+          - NonProdExpirationDays
+          - ProdTransitionDays
+          - ArchiveAccessDays
+          - DeepArchiveAccessDays
+          - NoncurrentVersionDays
+          - AbortIncompleteUploadDays
+      - Label: {default: Access}
+        Parameters: [AdminPermissionSetName, DeploymentRoleArn, RequireKmsHeader]
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, test, preprod, prod]
+    Description: Selects the lifecycle behaviour. Only prod keeps data indefinitely.
+  Application:
+    Type: String
+    AllowedPattern: '^[a-z0-9-]{1,32}$'
+    Description: Short application name, used in tags.
+  BucketName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    Description: Leave empty to let CloudFormation generate a unique name.
+  KmsKeyArn:
+    Type: String
+    Default: ''
+    Description: >
+      Customer managed KMS key for default encryption. Leave empty to use the
+      AWS managed key for S3 (aws/s3).
+
+  NonProdExpirationDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: dev, test and preprod. Current objects are expired after this many days.
+  ProdTransitionDays:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >
+      prod. Days after creation before objects move to INTELLIGENT_TIERING.
+      0 means the next daily lifecycle run.
+  ArchiveAccessDays:
+    Type: Number
+    Default: 0
+    AllowedValues: [0, 90, 120, 180, 270, 365, 730]
+    Description: >
+      prod. Days without access before an object moves to the Archive Access
+      tier. 0 turns the tier off. AWS minimum is 90, maximum 730.
+  DeepArchiveAccessDays:
+    Type: Number
+    Default: 0
+    AllowedValues: [0, 180, 270, 365, 730]
+    Description: >
+      prod. Days without access before an object moves to the Deep Archive
+      Access tier. 0 turns the tier off. AWS minimum is 180, maximum 730.
+      When both tiers are on, set this higher than ArchiveAccessDays.
+  NoncurrentVersionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Noncurrent (overwritten or deleted) versions are removed after this many days.
+  AbortIncompleteUploadDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    Description: Incomplete multipart uploads are aborted after this many days.
+
+  AdminPermissionSetName:
+    Type: String
+    Default: AdministratorAccess
+    AllowedPattern: '^[\w+=,.@-]{1,32}$'
+    Description: >
+      IAM Identity Center permission set allowed to change the bucket's
+      configuration and policy. Matched as AWSReservedSSO_<name>_*.
+  DeploymentRoleArn:
+    Type: String
+    Default: ''
+    Description: >
+      Role that deploys this stack, if not the admin permission set (for
+      example a CI role or a CloudFormation service role). Leave empty if
+      admins deploy.
+  RequireKmsHeader:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      'true' denies PutObject calls that do not send
+      x-amz-server-side-encryption aws:kms. 'false' only denies calls that ask
+      for a different algorithm and relies on default bucket encryption for
+      the rest.
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  IsNonProd: !Not [!Condition IsProd]
+  HasBucketName: !Not [!Equals [!Ref BucketName, '']]
+  HasKmsKey: !Not [!Equals [!Ref KmsKeyArn, '']]
+  HasDeploymentRole: !Not [!Equals [!Ref DeploymentRoleArn, '']]
+  StrictKmsHeader: !Equals [!Ref RequireKmsHeader, 'true']
+  HasArchiveAccess: !And
+    - !Condition IsProd
+    - !Not [!Equals [!Ref ArchiveAccessDays, '0']]
+  HasDeepArchiveAccess: !And
+    - !Condition IsProd
+    - !Not [!Equals [!Ref DeepArchiveAccessDays, '0']]
+  HasAnyArchiveTier: !Or
+    - !Condition HasArchiveAccess
+    - !Condition HasDeepArchiveAccess
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If [HasBucketName, !Ref BucketName, !Ref AWS::NoValue]
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced  # disables ACLs
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true  # cuts KMS request cost for SSE-KMS
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !If [HasKmsKey, !Ref KmsKeyArn, !Ref AWS::NoValue]
+      LifecycleConfiguration:
+        Rules:
+          # Every environment: clean up old versions, delete markers left
+          # behind once all versions are gone, and abandoned uploads.
+          - Id: housekeeping
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionDays
+            ExpiredObjectDeleteMarker: true
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: !Ref AbortIncompleteUploadDays
+          # dev, test, preprod: data is disposable after a fixed period.
+          - !If
+            - IsNonProd
+            - Id: expire-current-objects
+              Status: Enabled
+              ExpirationInDays: !Ref NonProdExpirationDays
+            - !Ref AWS::NoValue
+          # prod: move objects into Intelligent-Tiering. This is what puts
+          # objects in the storage class. The IntelligentTieringConfigurations
+          # block below only adds the optional archive tiers.
+          - !If
+            - IsProd
+            - Id: transition-to-intelligent-tiering
+              Status: Enabled
+              Transitions:
+                - StorageClass: INTELLIGENT_TIERING
+                  TransitionInDays: !Ref ProdTransitionDays
+            - !Ref AWS::NoValue
+      IntelligentTieringConfigurations: !If
+        - HasAnyArchiveTier
+        - - Id: archive-tiers
+            Status: Enabled
+            Tierings:
+              - !If
+                - HasArchiveAccess
+                - AccessTier: ARCHIVE_ACCESS
+                  Days: !Ref ArchiveAccessDays
+                - !Ref AWS::NoValue
+              - !If
+                - HasDeepArchiveAccess
+                - AccessTier: DEEP_ARCHIVE_ACCESS
+                  Days: !Ref DeepArchiveAccessDays
+                - !Ref AWS::NoValue
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Application
+          Value: !Ref Application
+        - Key: Environment
+          Value: !Ref Environment
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt Bucket.Arn
+              - !Sub '${Bucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+          - Sid: DenyTlsOlderThan12
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt Bucket.Arn
+              - !Sub '${Bucket.Arn}/*'
+            Condition:
+              NumericLessThan:
+                s3:TlsVersion: '1.2'
+
+          # Deny a request that asks for an algorithm other than SSE-KMS.
+          # Both conditions must match: the header is present (Null false)
+          # and it is not a KMS value.
+          - Sid: DenyNonKmsEncryptionHeader
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${Bucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: [aws:kms, 'aws:kms:dsse']
+              'Null':
+                s3:x-amz-server-side-encryption: 'false'
+
+          - Sid: DenyCustomerProvidedKeys
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${Bucket.Arn}/*'
+            Condition:
+              'Null':
+                s3:x-amz-server-side-encryption-customer-algorithm: 'false'
+
+          # Optional strict mode: also deny uploads that send no encryption
+          # header at all. Clients that rely on default encryption will fail.
+          - !If
+            - StrictKmsHeader
+            - Sid: DenyMissingKmsHeader
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:PutObject'
+              Resource: !Sub '${Bucket.Arn}/*'
+              Condition:
+                'Null':
+                  s3:x-amz-server-side-encryption: 'true'
+            - !Ref AWS::NoValue
+
+          # Only admins (and the deployment role) may change bucket settings.
+          # The Principal element cannot contain wildcards, so the role
+          # pattern is matched with aws:PrincipalArn instead. For an assumed
+          # role, aws:PrincipalArn is the role ARN, not the session ARN.
+          # The * after sso.amazonaws.com/ covers the optional region segment
+          # in Identity Center role paths.
+          # This is a Deny with ArnNotLike, not an Allow with ArnLike. S3
+          # treats an Allow to Principal * as public unless its condition uses
+          # fixed values, and a wildcard pattern is not fixed, so with
+          # BlockPublicPolicy on such a policy would be rejected.
+          # The account root user can still delete a bucket policy that locks
+          # everyone else out.
+          - Sid: RestrictBucketAdministration
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - s3:DeleteBucket
+              - s3:DeleteBucketPolicy
+              - s3:PutBucketPolicy
+              - s3:PutBucketPublicAccessBlock
+              - s3:PutBucketOwnershipControls
+              - s3:PutBucketVersioning
+              - s3:PutEncryptionConfiguration
+              - s3:PutLifecycleConfiguration
+              - s3:PutIntelligentTieringConfiguration
+            Resource: !GetAtt Bucket.Arn
+            Condition:
+              ArnNotLike:
+                aws:PrincipalArn: !If
+                  - HasDeploymentRole
+                  - - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_${AdminPermissionSetName}_*'
+                    - !Ref DeploymentRoleArn
+                  - - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_${AdminPermissionSetName}_*'
+
+Outputs:
+  BucketName:
+    Value: !Ref Bucket
+  BucketArn:
+    Value: !GetAtt Bucket.Arn

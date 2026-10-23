@@ -1,0 +1,47 @@
+{
+  "version": "0",
+  "id": "example-event-id",
+  "detail-type": "Config Rules Compliance Change",
+  "source": "aws.config",
+  "account": "EXAMPLE-ACCOUNT",
+  "time": "2026-01-15T08:00:00Z",
+  "region": "eu-central-1",
+  "resources": [],
+  "detail": {
+    "resourceId": "example-raw-data-bucket",
+    "awsRegion": "eu-central-1",
+    "awsAccountId": "EXAMPLE-ACCOUNT",
+    "configRuleName": "cost-s3-lifecycle-policy-present",
+    "recordVersion": "1.0",
+    "configRuleARN": "arn:aws:config:eu-central-1:EXAMPLE-ACCOUNT:config-rule/config-rule-example",
+    "messageType": "ComplianceChangeNotification",
+    "newEvaluationResult": {
+      "evaluationResultIdentifier": {
+        "evaluationResultQualifier": {
+          "configRuleName": "cost-s3-lifecycle-policy-present",
+          "resourceType": "AWS::S3::Bucket",
+          "resourceId": "example-raw-data-bucket"
+        },
+        "orderingTimestamp": "2026-01-15T07:59:00.000Z"
+      },
+      "complianceType": "NON_COMPLIANT",
+      "resultRecordedTime": "2026-01-15T08:00:00.000Z",
+      "configRuleInvokedTime": "2026-01-15T07:59:30.000Z"
+    },
+    "oldEvaluationResult": {
+      "evaluationResultIdentifier": {
+        "evaluationResultQualifier": {
+          "configRuleName": "cost-s3-lifecycle-policy-present",
+          "resourceType": "AWS::S3::Bucket",
+          "resourceId": "example-raw-data-bucket"
+        },
+        "orderingTimestamp": "2026-01-14T07:59:00.000Z"
+      },
+      "complianceType": "COMPLIANT",
+      "resultRecordedTime": "2026-01-14T08:00:00.000Z",
+      "configRuleInvokedTime": "2026-01-14T07:59:30.000Z"
+    },
+    "notificationCreationTime": "2026-01-15T08:00:01.000Z",
+    "resourceType": "AWS::S3::Bucket"
+  }
+}
